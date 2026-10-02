@@ -1,0 +1,428 @@
+#!/usr/bin/env bash
+# ============================================
+#  Coverflow 3D - Selector de temas y wallpapers
+#  Hyprland + Quickshell + awww + wallust
+#
+#  Este script es deliberadamente sin estado.
+#  Toda la navegacion vive en el lado QML; aqui
+#  solo se listan items y se aplican cambios.
+# ============================================
+
+set -uo pipefail
+
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+WALLPAPER_DIR="$SCRIPT_DIR/themes/wallpapers"
+THUMBNAIL_DIR="$SCRIPT_DIR/thumbnails"
+CACHE_DIR="$SCRIPT_DIR/cache"
+PALETTE_CACHE="$CACHE_DIR/palettes.json"
+PALETTE_COUNT="$CACHE_DIR/palettes.count"
+STATE_FILE="$SCRIPT_DIR/.state"
+HYPR_SCRIPTS="$HOME/.config/hypr/scripts/coverflow"
+
+# Log de la interfaz. Antes la salida de quickshell iba a /dev/null:
+# si el QML no cargaba no habia ni un mensaje, solo un atajo que no
+# hacia nada. Ahora cada apertura deja rastro aqui.
+LOG_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/coverflow"
+LOG_FILE="$LOG_DIR/quickshell.log"
+
+THUMB_W=400
+THUMB_H=225
+
+C_BG=$'\033[0;34m'; C_OK=$'\033[0;32m'
+C_WARN=$'\033[1;33m'; C_ERR=$'\033[0;31m'; C_OFF=$'\033[0m'
+
+log()  { printf '%s[coverflow]%s %s\n' "$C_BG" "$C_OFF" "$1"; }
+ok()   { printf '%s[coverflow]%s %s\n' "$C_OK" "$C_OFF" "$1"; }
+warn() { printf '%s[coverflow]%s %s\n' "$C_WARN" "$C_OFF" "$1" >&2; }
+die()  { printf '%s[coverflow]%s %s\n' "$C_ERR" "$C_OFF" "$1" >&2; exit 1; }
+
+# ------------------------------------------------------------
+# Utilidades
+# ------------------------------------------------------------
+
+json_escape() {
+    # Escapa una cadena para incrustarla en JSON.
+    local s=$1
+    s=${s//\\/\\\\}
+    s=${s//\"/\\\"}
+    printf '%s' "$s"
+}
+
+is_image() {
+    case "${1,,}" in
+        *.jpg|*.jpeg|*.png|*.webp|*.bmp) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+# ------------------------------------------------------------
+# Miniaturas
+# ------------------------------------------------------------
+
+make_thumb() {
+    # make_thumb <ruta-imagen> -> ruta miniatura por stdout
+    local src=$1
+    local name hash dest
+
+    [[ -f $src ]] || return 1
+    command -v magick >/dev/null 2>&1 || command -v convert >/dev/null 2>&1 || return 1
+
+    name=$(basename -- "$src")
+    hash=$(md5sum -- "$src" 2>/dev/null | cut -d' ' -f1)
+    dest="$THUMBNAIL_DIR/${name%.*}_$hash.jpg"
+
+    if [[ ! -f $dest ]]; then
+        mkdir -p -- "$THUMBNAIL_DIR"
+        if command -v magick >/dev/null 2>&1; then
+            magick "$src" -auto-orient -resize "${THUMB_W}x${THUMB_H}^" \
+                -gravity center -extent "${THUMB_W}x${THUMB_H}" \
+                -strip -quality 82 "$dest" 2>/dev/null || return 1
+        else
+            convert "$src" -auto-orient -resize "${THUMB_W}x${THUMB_H}^" \
+                -gravity center -extent "${THUMB_W}x${THUMB_H}" \
+                -strip -quality 82 "$dest" 2>/dev/null || return 1
+        fi
+    fi
+
+    printf '%s' "$dest"
+}
+
+# ------------------------------------------------------------
+# Listado
+# ------------------------------------------------------------
+
+list_wallpapers() {
+    local first=1
+
+    [[ -d $WALLPAPER_DIR ]] || { printf '[]'; return 0; }
+
+    printf '['
+    while IFS= read -r -d '' f; do
+        local thumb
+        thumb=$(make_thumb "$f") || thumb=""
+        [[ $first -eq 1 ]] || printf ','
+        first=0
+        printf '{"name":"%s","path":"%s","thumb":"%s"}' \
+            "$(json_escape "$(basename -- "${f%.*}")")" \
+            "$(json_escape "$f")" \
+            "$(json_escape "$thumb")"
+    done < <(find "$WALLPAPER_DIR" -maxdepth 1 -type f -print0 2>/dev/null \
+        | while IFS= read -r -d '' p; do is_image "$p" && printf '%s\0' "$p"; done \
+        | sort -z)
+    printf ']'
+}
+
+# ------------------------------------------------------------
+# Paletas de wallust
+# ------------------------------------------------------------
+#
+# Sin esto las 600+ paletas se ven todas iguales: el degradado de
+# muestra usaba `accent` y `accentAlt` de la paleta ACTUAL, que
+# souvent coinciden (en una paleta gris los dos son el mismo gris).
+# La unica forma de que cada tema muestre su color de verdad es
+# preguntarselo a wallust, que los lleva compilados dentro.
+#
+# `wallust theme <t> -p` imprime los 16 colores como secuencias ANSI
+# `48;2;R;G;B`. Extraerlos de ahi son 616 llamadas, pero en total
+# tardan ~1s, asi que se cachean y no se repetiran hasta que cambie
+# el numero de temas.
+
+theme_names() {
+    # `theme list` emite ANSI, una cabecera y el prefijo "- ", y las
+    # ultimas lineas son dos subcomandos ("random", "list") con su
+    # descripcion entre parentesis, no temas. Se descartan.
+    wallust theme list 2>/dev/null \
+        | sed -e 's/\x1b\[[0-9;]*m//g' -e 's/[[:space:]]*$//' \
+        | sed -n 's/^- //p' \
+        | grep -vE '^(random|list)\b'
+}
+
+theme_swatch() {
+    local hex
+    # Cada color va entrecomillado: son cadenas JSON, no numeros.
+    hex=$(wallust theme "$1" -p 2>/dev/null \
+        | grep -oE '48;2;[0-9]+;[0-9]+;[0-9]+' \
+        | sed 's/^48;2;//' \
+        | awk -F';' '{ printf "\"#%02x%02x%02x\",", $1, $2, $3 }' \
+        | sed 's/,$//')
+
+    if [[ -z $hex ]]; then
+        printf '[]'
+        return 0
+    fi
+    printf '[%s]' "$hex"
+}
+
+build_palette_cache() {
+    local force=${1:-}
+    local -a names=()
+    mapfile -t names < <(theme_names)
+
+    local count=${#names[@]}
+    (( count > 0 )) || return 1
+
+    # Solo se rehace si no existe o si wallust ahora expone otra
+    # cantidad de temas (o sea, se actualizo el paquete).
+    if [[ $force != force && -s $PALETTE_CACHE && -s $PALETTE_COUNT ]]; then
+        [[ $(<"$PALETTE_COUNT") == "$count" ]] && return 0
+    fi
+
+    mkdir -p -- "$CACHE_DIR" || return 1
+
+    local tmp="$PALETTE_CACHE.$$" t first=1
+    {
+        printf '['
+        for t in "${names[@]}"; do
+            [[ $first -eq 1 ]] || printf ','
+            first=0
+            printf '{"name":"%s","path":"builtin:%s","thumb":"","swatch":%s}' \
+                "$(json_escape "$t")" "$(json_escape "$t")" "$(theme_swatch "$t")"
+        done
+        printf ']'
+    } >"$tmp" || { rm -f -- "$tmp"; return 1; }
+
+    # Se escribe el numero solo cuando el JSON ya esta completo, para
+    # que una interrupcion no deje una cache marcada como valida.
+    mv -f -- "$tmp" "$PALETTE_CACHE" && printf '%s' "$count" >"$PALETTE_COUNT"
+}
+
+list_presets() {
+    build_palette_cache || true
+
+    if [[ -s $PALETTE_CACHE ]]; then
+        cat "$PALETTE_CACHE"
+    else
+        # Sin wallust no hay nada que listar. Antes esto devolvia la
+        # lista de nombres sin color, que se veia como un panel vacio.
+        warn "no se pudo construir la cache de paletas; revisa que wallust este instalado"
+        printf '[]'
+    fi
+}
+
+cmd_list() {
+    case "${1:-wallpapers}" in
+        wallpapers) list_wallpapers ;;
+        presets)    list_presets ;;
+        *)          die "modo desconocido: $1" ;;
+    esac
+}
+
+# ------------------------------------------------------------
+# Aplicacion
+# ------------------------------------------------------------
+
+apply_wallpaper() {
+    local path=$1
+
+    [[ -e $path ]] || die "ruta inexistente: $path"
+    is_image "$path" || die "no es una imagen: $path"
+
+    # --- Fondo con transicion (awww) ---
+    if command -v awww >/dev/null 2>&1; then
+        # El socket de IPC es la senal fiable: `pgrep -x` no lo detecta
+        # en este sistema y `pgrep -f` daria falsos positivos con
+        # cualquier shell cuya linea de comandos mencione "awww-daemon".
+        if ! compgen -G "${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/wayland-*-awww-daemon.sock" >/dev/null 2>&1; then
+            awww-daemon >/dev/null 2>&1 &
+            sleep 0.4
+        fi
+        awww img "$path" \
+            --transition-type wipe \
+            --transition-duration 1.5 \
+            --transition-fps 60 >/dev/null 2>&1 \
+            || warn "awww no pudo aplicar el fondo"
+    else
+        warn "awww no encontrado; el fondo no cambiara"
+    fi
+
+    # --- Paleta (wallust) ---
+    if [[ ${COVERFLOW_NO_COLORS:-0} != 1 ]] && command -v wallust >/dev/null 2>&1; then
+        wallust run "$path" >/dev/null 2>&1 || warn "wallust no pudo extraer la paleta"
+        sync_terminals
+    fi
+
+    printf '%s\n' "$path" > "$STATE_FILE"
+    ok "aplicado: $(basename -- "$path")"
+}
+
+sync_terminals() {
+    # kitty recarga su configuracion con SIGUSR1
+    pkill -USR1 -x kitty 2>/dev/null || true
+}
+
+apply_preset() {
+    local path=$1
+
+    case "$path" in
+        builtin:*)
+            local theme=${path#builtin:}
+            wallust theme "$theme" >/dev/null 2>&1 || die "tema desconocido: $theme"
+            sync_terminals
+            ok "tema aplicado: $theme"
+            ;;
+        *)
+            [[ -f $path ]] || die "preset inexistente: $path"
+            wallust cs "$path" >/dev/null 2>&1 || die "wallust cs fallo con: $path"
+            sync_terminals
+            ok "preset aplicado: $(basename -- "$path")"
+            ;;
+    esac
+}
+
+# ------------------------------------------------------------
+# Lanzador
+# ------------------------------------------------------------
+
+launch() {
+    local mode=${1:-}
+
+    # Sin modo, la propia interfaz abre el selector. Antes esto lo
+    # hacia rofi, pero bajo Hyprland se quedaba sin capturar el Enter
+    # (las flechas si llegaban), asi que ahora vive en el mismo QML.
+    case "$mode" in
+        wallpapers|presets) ;;
+        "") mode="" ;;
+        *) die "modo desconocido: $mode  (usa wallpapers o presets)" ;;
+    esac
+
+    command -v quickshell >/dev/null 2>&1 || die "quickshell no esta instalado (sudo pacman -S quickshell)"
+
+    local cfg="$HOME/.config/quickshell/coverflow.qsl"
+    [[ -f $cfg ]] || die "no se encuentra la interfaz: $cfg"
+
+    # Si ya hay una instancia viva, se cierra antes de abrir otra
+    # para no acumular overlays.
+    pkill -f 'quickshell.*coverflow\.qsl' 2>/dev/null || true
+    sleep 0.15
+
+    # El modo viaja por variable de entorno: la interfaz lo lee
+    # con Quickshell.env() al arrancar, sin ficheros intermedios.
+    # Sin modo, COVERFLOW_MODE va vacio y la interfaz muestra el selector.
+    mkdir -p -- "$LOG_DIR" 2>/dev/null || true
+    touch -- "$LOG_FILE" 2>/dev/null || true
+
+    {
+        printf '\n=== %s :: open %s ===\n' "$(date '+%F %T')" "${mode:-<selector>}"
+    } >>"$LOG_FILE" 2>/dev/null
+
+    COVERFLOW_MODE="$mode" setsid quickshell -p "$cfg" >>"$LOG_FILE" 2>&1 &
+}
+
+# ------------------------------------------------------------
+# Utilidades
+# ------------------------------------------------------------
+
+clean_cache() {
+    local n=0
+
+    if [[ -d $THUMBNAIL_DIR ]]; then
+        find "$THUMBNAIL_DIR" -type f -name '*.jpg' -delete 2>/dev/null
+        n=1
+    fi
+    if [[ -f $PALETTE_CACHE ]]; then
+        rm -f -- "$PALETTE_CACHE" "$PALETTE_COUNT"
+        n=1
+    fi
+
+    if (( n )); then
+        ok "cache limpiada (miniaturas y paletas)"
+    else
+        log "no hay cache que limpiar"
+    fi
+}
+
+show_log() {
+    local n=${1:-60}
+
+    if [[ ! -f $LOG_FILE ]]; then
+        log "aun no se ha abierto la interfaz; no hay log en $LOG_FILE"
+        return 0
+    fi
+
+    log "ultimas $n lineas de $LOG_FILE:"
+    tail -n "$n" -- "$LOG_FILE"
+}
+
+cache_palettes() {
+    if build_palette_cache force; then
+        ok "cache de paletas construida: $(<"$PALETTE_COUNT") temas"
+    else
+        die "no se pudo construir la cache de paletas (revisa que wallust este instalado)"
+    fi
+}
+
+usage() {
+    cat <<'EOF'
+coverflow.sh - Selector de temas y wallpapers (Coverflow 3D)
+
+USO
+  coverflow.sh [comando] [argumento]
+
+COMANDOS
+  open [modo]      Abrir la interfaz. Sin modo, muestra el selector
+                   de modos dentro de la propia ventana.
+                   Modos: wallpapers | presets
+  list [modo]      Volcar los items en JSON por stdout
+  apply <ruta>     Aplicar un wallpaper (sin transicion visual)
+  preset <ruta>    Aplicar una paleta. Acepta builtin:<tema> o un archivo
+  cache-palettes   Rehacer la cache con los colores de cada tema
+  clean            Borrar las caches (miniaturas y paletas)
+  log [n]          Ver las ultimas n lineas del log de la interfaz
+  help             Esta ayuda
+
+EJEMPLOS
+  coverflow.sh open
+  coverflow.sh open wallpapers
+  coverflow.sh list wallpapers
+  coverflow.sh apply ~/Pictures/foto.jpg
+  coverflow.sh preset builtin:catppuccin-mocha
+  coverflow.sh log 100
+EOF
+}
+
+# ------------------------------------------------------------
+# Entrada
+# ------------------------------------------------------------
+
+main() {
+    local cmd=${1:-open}
+
+    case "$cmd" in
+        open)
+            shift || true
+            launch "${1:-}"
+            ;;
+        list)
+            shift || true
+            cmd_list "${1:-wallpapers}"
+            ;;
+        apply)
+            shift || true
+            [[ $# -gt 0 ]] || die "falta la ruta del wallpaper"
+            apply_wallpaper "$1"
+            ;;
+        preset)
+            shift || true
+            [[ $# -gt 0 ]] || die "falta el preset"
+            apply_preset "$1"
+            ;;
+        clean)
+            clean_cache
+            ;;
+        cache-palettes)
+            cache_palettes
+            ;;
+        log)
+            shift || true
+            show_log "${1:-60}"
+            ;;
+        help|-h|--help)
+            usage
+            ;;
+        *)
+            die "comando desconocido: $cmd  (prueba 'help')"
+            ;;
+    esac
+}
+
+main "$@"

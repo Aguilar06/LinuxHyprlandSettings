@@ -1,0 +1,156 @@
+# Coverflow 3D — Selector de temas y wallpapers
+
+Carrusel 3D para Hyprland: navega entre wallpapers y paletas, y aplica el
+fondo, la paleta del terminal y los colores de la interfaz de una vez.
+
+```
+SUPER + T  ──▶  quickshell coverflow.qsl
+                       │
+                   selector de modo (QML)
+                       ▼
+                                            │
+                        ┌───────────────────┴──────────────────┐
+                        ▼                                      ▼
+              coverflow.sh list <modo>              coverflow.sh apply <ruta>
+              (JSON por stdout, cachea                    │
+               miniaturas con ImageMagick)        awww img  +  wallust run
+```
+
+La navegación entera vive en QML. El script solo lista y aplica, así que
+moverse por el carrusel no lanza ningún proceso: por eso las animaciones
+van fluidas.
+
+## Piezas
+
+| Herramienta | Papel | Nota |
+|---|---|---|
+| `quickshell` | Interfaz del carrusel | QtQuick, perspectiva 3D real |
+| `awww` | Transiciones del fondo | Sustituye a `swww`, que ya no existe |
+| `wallust` | Extrae la paleta y la reparte | |
+| `imagemagick` | Miniaturas cacheadas | |
+
+## Instalación
+
+```bash
+~/.config/hypr/scripts/coverflow/install.sh
+hyprctl reload
+```
+
+El script instala `quickshell` e `imagemagick`, todos de los
+repositorios oficiales. No hay nada que compilar.
+
+## Uso
+
+| Atajo | Acción |
+|---|---|
+| `SUPER + T` | Abrir el selector de modo |
+| `SUPER + SHIFT + T` | Abrir directo en modo Wallpapers |
+| `←` `→` (o `h` `l`) | Moverse por el carrusel |
+| `Enter` | Aplicar el seleccionado |
+| `Esc` | Cerrar |
+| Clic | Aplicar el item central |
+
+### Modos
+
+- **Wallpapers** — imágenes sueltas en `themes/wallpapers/`
+- **Albums** — cada subdirectorio es un grupo; al aplicarlo sale una imagen al azar
+- **Paletas de wallust** — los 614 temas integrados (`wallust theme`), cada uno
+  con sus 16 colores de muestra
+
+## Wallpapers
+
+```
+themes/wallpapers/
+├── wallhaven-1234_1920x1080.png     ← modo Wallpapers
+├── nature/                          ← modo Albums
+│   ├── bosque.png
+│   └── naturaleza.png
+└── minimal/
+    └── noche.png
+```
+
+## Comandos
+
+```bash
+coverflow.sh open [modo]            # abrir (sin modo: selector en QML)
+coverflow.sh list [modo]            # volcar items en JSON
+coverflow.sh apply <ruta>           # aplicar wallpaper o álbum
+coverflow.sh preset builtin:<tema>  # aplicar paleta
+coverflow.sh cache-palettes         # rehacer la caché de paletas
+coverflow.sh clean                  # borrar cachés (miniaturas y paletas)
+coverflow.sh help
+```
+
+## Colores
+
+`wallust` lee el wallpaper y escribe:
+
+- `~/.config/quickshell/colors.json` → lo lee la interfaz QML
+- `~/.config/kitty/themes/wallust.conf` → lo incluye `kitty.conf`
+
+Las plantillas están en `~/.config/wallust/templates/`. Son de Tera
+(`{{ color5 }}`), no de pywal, porque wallust v3 usa ese formato.
+
+Las terminales abiertas reciben `SIGUSR1` para recargar el include.
+
+## Ajustes
+
+En la cabecera de `coverflow.qsl`:
+
+```qml
+readonly property int cardWidth: 300
+readonly property int cardHeight: 169  // 16:9
+readonly property int cardGap: 30      // hueco entre cartas ya proyectadas
+readonly property int reach: 2         // items visibles a cada lado (5 cartas)
+readonly property real eye: 1100       // distancia de la cámara
+```
+
+`eye` se usa en dos sitios a propósito: en la matriz `Matrix4x4` y en
+`centerOffset()`/`halfAt()`, que calculan dónde cae cada carta. Si divergen,
+las cartas se colocan bien pero caen donde no toca y el carrusel se ve
+descentrado.
+
+El ancho del panel no está fijo, se calcula con `layoutWidth` a partir de las
+cartas ya proyectadas. Por eso nunca se salen del recuadro, por muy lejos que
+esté la carta.
+
+En `apply_wallpaper()` del script, la transición:
+
+```bash
+--transition-type wipe    # wipe | wave | grow | fade | left | right | top | bottom
+--transition-duration 1.5
+--transition-fps 60
+```
+
+## Caché de paletas
+
+Los temas de wallust van compilados dentro del binario: no hay ficheros TOML
+que leer. Para que cada paleta muestre su color de verdad hay que preguntárselo
+a wallust con `wallust theme <tema> -p`, que imprime los 16 colores como
+secuencias ANSI `48;2;R;G;B`.
+
+Son 614 llamadas, pero en total tardan ~2,5 s, así que el resultado se guarda
+en `cache/palettes.json` y se reutiliza (13 ms). Se rehace sola si wallust
+expone otra cantidad de temas, y a mano con `coverflow.sh cache-palettes`.
+
+Sin esta caché, todas las paletas se veían iguales: la muestra usaba
+`accent` y `accentAlt` de la paleta **actual**, que en una paleta gris
+coinciden y salen como un rectángulo liso.
+
+## Notas
+
+- `swww` se eliminó de los repos: ahora las transiciones las da `awww`.
+- `rofi` se usó primero para el menú de modos, pero bajo Hyprland las flechas
+  llegaban y el `Enter` no. El menú se hizo en QML y rofi dejó de hacer falta.
+- El tipo `Perspective` de Qt 6 ya no existe. La proyección se hace a mano con
+  `Matrix4x4`: divide cada punto por `w = 1 - z/eye`, y eso escala respecto
+  al origen del item. Por eso las cartas lejanas se empujaban fuera del panel
+  hasta que se corrigió la posición multiplicando por `w`.
+- `eww` no se usa. Se probó primero, pero no puede generar widgets en
+  bucle sobre un array, que es justo lo que necesita un carrusel. QML sí.
+- El overlay usa `exclusionMode: Ignore` y `exclusiveZone: 0`, así que no
+  reserva espacio ni redimensiona lo que hay debajo.
+- `awww-daemon` se levanta en el autostart de Hyprland vía `restore.sh`,
+  que además recupera el último wallpaper aplicado.
+- Cuando montes la barra en Quickshell, `coverflow.qsl` se integra como una
+  ventana más del shell principal.
